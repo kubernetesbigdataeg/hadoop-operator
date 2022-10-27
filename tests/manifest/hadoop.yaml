@@ -1,0 +1,475 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hdfs-client
+  labels:
+    app: hdfs-client
+    release: hdfs-ha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hdfs-client
+      release: hdfs-ha
+  template:
+    metadata:
+      labels:
+        app: hdfs-client
+        release: hdfs-ha
+    spec:
+      containers:
+        - name: hdfs-client
+          imagePullPolicy: Always
+          image: mariolopezz/hadoop:2.7.2
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+          command: ['/bin/sh', '-c']
+          args:
+            - /entrypoint.sh /usr/bin/tail -f /var/log/dmesg
+          volumeMounts:
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+      restartPolicy: Always
+      volumes:
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-config
+  labels:
+    app: hdfs-config
+    release: hdfs-ha
+data:
+  hadoop.env: |
+    export HADOOP__coresite__fs_defaultFS="hdfs://hdfs-k8s"
+    export HADOOP__coresite__ha_zookeeper_quorum="zk-0.zk-hs.default.svc.cluster.local:2181,zk-1.zk-hs.default.svc.cluster.local:2181,zk-2.zk-hs.default.svc.cluster.local:2181"
+    export HADOOP__hdfssite__dfs_nameservices="hdfs-k8s"
+    export HADOOP__hdfssite__dfs_ha_namenodes_hdfs___k8s="nn0,nn1"
+    export HADOOP__hdfssite__dfs_namenode_rpc___address_hdfs___k8s_nn0="hdfs-namenode-0.hdfs-namenode-svc.default.svc.cluster.local:8020"
+    export HADOOP__hdfssite__dfs_namenode_rpc___address_hdfs___k8s_nn1="hdfs-namenode-1.hdfs-namenode-svc.default.svc.cluster.local:8020"
+    export HADOOP__hdfssite__dfs_namenode_http___address_hdfs___k8s_nn0="hdfs-namenode-0.hdfs-namenode-svc.default.svc.cluster.local:50070"
+    export HADOOP__hdfssite__dfs_namenode_http___address_hdfs___k8s_nn1="hdfs-namenode-1.hdfs-namenode-svc.default.svc.cluster.local:50070"
+    export HADOOP__hdfssite__dfs_namenode_shared_edits_dir="qjournal://hdfs-journalnode-0.hdfs-journalnode-svc.default.svc.cluster.local:8485;hdfs-journalnode-1.hdfs-journalnode-svc.default.svc.cluster.local:8485;hdfs-journalnode-2.hdfs-journalnode-svc.default.svc.cluster.local:8485/hdfs-k8s"
+    export HADOOP__hdfssite__dfs_ha_automatic___failover_enabled="true"
+    export HADOOP__hdfssite__dfs_ha_fencing_methods="shell(/bin/true)"
+    export HADOOP__hdfssite__dfs_journalnode_edits_dir="/hadoop/dfs/journal"
+    export HADOOP__hdfssite__dfs_client_failover_proxy_provider_hdfs___k8s="org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider"
+    export HADOOP__hdfssite__dfs_namenode_name_dir="file:///hadoop/dfs/name"
+    export HADOOP__hdfssite__dfs_namenode_datanode_registration_ip___hostname___check="false"
+    export HADOOP__hdfssite__dfs_datanode_data_dir="/hadoop/dfs/data"
+---
+# Provides datanode helper scripts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-datanode-scripts
+  labels:
+    app: hdfs-datanode-app
+    release: hdfs-ha
+data:
+  check-status.sh: |
+    #!/usr/bin/env bash
+    # Exit on error. Append "|| true" if you expect an error.
+    set -o errexit
+    # Exit on error inside any functions or subshells.
+    set -o errtrace
+    # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+    set -o nounset
+    # Catch an error in command pipes. e.g. mysqldump fails (but gzip succeeds)
+    # in `mysqldump |gzip`
+    set -o pipefail
+    # Turn on traces, useful while debugging.
+    set -o xtrace
+
+    # Check if datanode registered with the namenode and got non-null cluster ID.
+    _PORTS="50075 1006"
+    _URL_PATH="jmx?qry=Hadoop:service=DataNode,name=DataNodeInfo"
+    _CLUSTER_ID=""
+    for _PORT in $_PORTS; do
+      _CLUSTER_ID+=$(curl -s http://localhost:${_PORT}/$_URL_PATH |  \
+          grep ClusterId) || true
+    done
+    echo $_CLUSTER_ID | grep -q -v null
+---
+# Deleting a daemonset may need some trick. See
+# https://github.com/kubernetes/kubernetes/issues/33245#issuecomment-261250489
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hdfs-datanode
+  labels:
+    app: hdfs-datanode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app:  hdfs-datanode-app
+  template:
+    metadata:
+      labels:
+        app: hdfs-datanode-app
+        release: hdfs-ha
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: datanode
+          imagePullPolicy: IfNotPresent
+          image: mariolopezz/hadoop-datanode:2.7.2
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+          livenessProbe:
+            exec:
+              command:
+                - /dn-scripts/check-status.sh
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command:
+                - /dn-scripts/check-status.sh
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: dn-scripts
+              mountPath: /dn-scripts
+              readOnly: true
+            - name: hdfs-env
+              mountPath: /etc/environments
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+            - name: hdfs-data
+              mountPath: /hadoop/dfs/data/
+      restartPolicy: Always
+      volumes:
+        - name: dn-scripts
+          configMap:
+            name: hdfs-datanode-scripts
+            defaultMode: 0744
+        - name: hdfs-data
+          hostPath:
+            path: /hdfs-data
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+        - name: hdfs-env
+          configMap:
+            name: hdfs-config
+---
+# A headless service to create DNS records.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs-journalnode-svc
+  labels:
+    app: hdfs-journalnode-app
+    release: hdfs-ha
+  annotations:
+    # TODO: Deprecated. Replace tolerate-unready-endpoints with
+    # v1.Service.PublishNotReadyAddresses.
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+  - port: 8485
+    name: jn
+  - port: 8480
+    name: http
+  clusterIP: None
+  selector:
+    app: hdfs-journalnode-app
+    release: hdfs-ha
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hdfs-journalnode
+  labels:
+    app: hdfs-journalnode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app: hdfs-journalnode-app
+      release: hdfs-ha
+  minAvailable: 2
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-journalnode
+  labels:
+    app: hdfs-journalnode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app: hdfs-journalnode-app
+  serviceName: hdfs-journalnode-svc
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: hdfs-journalnode-app
+        release: hdfs-ha
+    spec:
+      containers:
+        - name: hdfs-journalnode
+          imagePullPolicy: IfNotPresent
+          image: mariolopezz/hadoop-namenode:2.7.2
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+          command: ["/entrypoint.sh"]
+          args: ["/opt/hadoop-2.7.2/bin/hdfs", "--config", "/etc/hadoop", "journalnode"]
+          ports:
+          - containerPort: 8485
+            name: jn
+          - containerPort: 8480
+            name: http
+          volumeMounts:
+            # Mount a subpath of the volume so that the journal subdir would be
+            # a brand new empty dir. This way, we won't get affected by
+            # existing files in the volume top dir.
+            - name: editdir
+              mountPath: /hadoop/dfs/journal
+              subPath: journal
+            - name: editdir
+              mountPath: /hadoop/dfs/name
+              subPath: name
+            - name: hdfs-env
+              mountPath: /etc/environments
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+      restartPolicy: Always
+      volumes:
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+        - name: hdfs-env
+          configMap:
+            name: hdfs-config
+  volumeClaimTemplates:
+    - metadata:
+        name: editdir
+      spec:
+        accessModes: 
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: "20Gi"
+---
+# A headless service to create DNS records.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs-namenode-svc
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+  annotations:
+    # TODO: Deprecated. Replace tolerate-unready-endpoints with
+    # v1.Service.PublishNotReadyAddresses.
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+  - port: 8020
+    name: fs
+  - port: 50070
+    name: http
+  clusterIP: None
+  selector:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hdfs-namenode
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app: hdfs-namenode-app
+      release: hdfs-ha
+  minAvailable: 1
+---
+# Provides namenode helper scripts. Most of them are start scripts
+# that meet different needs.
+# TODO: Support upgrade of metadata in case a new Hadoop version requires it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-namenode-scripts
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+data:
+  # A bootstrap script which will start namenode daemons after conducting
+  # optional metadata initialization steps. The metadata initialization
+  # steps will take place in case the metadata dir is empty,
+  # which will be the case only for the very first run. The specific steps
+  # will differ depending on whether the namenode is active or standby.
+  # We also assume, for the very first run, namenode-0 will be active and
+  # namenode-1 will be standby as StatefulSet will launch namenode-0 first
+  # and zookeeper will determine the sole namenode to be the active one.
+  # For active namenode, the initialization steps will format the metadata,
+  # zookeeper dir and journal node data entries.
+  # For standby namenode, the initialization steps will simply receieve
+  # the first batch of metadata updates from the journal node.
+  format-and-run.sh: |
+    #!/usr/bin/env bash
+    # Exit on error. Append "|| true" if you expect an error.
+    set -o errexit
+    # Exit on error inside any functions or subshells.
+    set -o errtrace
+    # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+    set -o nounset
+    # Catch an error in command pipes. e.g. mysqldump fails (but gzip succeeds)
+    # in `mysqldump |gzip`
+    set -o pipefail
+    # Turn on traces, useful while debugging.
+    set -o xtrace
+    apt-get install procps -y 
+    _HDFS_BIN=$HADOOP_PREFIX/bin/hdfs
+    _METADATA_DIR=/hadoop/dfs/name/current
+    if [[ "$MY_POD" = "$NAMENODE_POD_0" ]]; then
+      if [[ ! -d $_METADATA_DIR ]]; then
+          $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -format  \
+              -nonInteractive hdfs-k8s ||
+              (rm -rf $_METADATA_DIR; exit 1)
+      fi
+      _ZKFC_FORMATTED=/hadoop/dfs/name/current/.hdfs-k8s-zkfc-formatted
+      if [[ ! -f $_ZKFC_FORMATTED ]]; then
+        _OUT=$($_HDFS_BIN --config $HADOOP_CONF_DIR zkfc -formatZK -nonInteractive 2>&1)
+        # zkfc masks fatal exceptions and returns exit code 0
+        (echo $_OUT | grep -q "FATAL") && exit 1
+        touch $_ZKFC_FORMATTED
+      fi
+    elif [[ "$MY_POD" = "$NAMENODE_POD_1" ]]; then
+      if [[ ! -d $_METADATA_DIR ]]; then
+        $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -bootstrapStandby  \
+            -nonInteractive ||  \
+            (rm -rf $_METADATA_DIR; exit 1)
+      fi
+    fi
+    $HADOOP_PREFIX/sbin/hadoop-daemon.sh --config $HADOOP_CONF_DIR start zkfc
+    $_HDFS_BIN --config $HADOOP_CONF_DIR namenode
+
+  # A start script that will just hang indefinitely. A user can then get
+  # inside the pod and debug. Or a user can conduct a custom manual operations.
+  do-nothing.sh: |
+    #!/usr/bin/env bash
+    touch /var/log/dmesg
+    tail -f /var/log/dmesg
+
+  # A start script that has user specified content. Can be used to conduct
+  # ad-hoc operation as specified by a user.
+  custom-run.sh: "#!/bin/bash -x
+    echo Write your own script content!
+    echo This message will disappear in 10 seconds.
+    sleep 10"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-namenode
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+spec:
+  serviceName: hdfs-namenode-svc
+  selector:
+    matchLabels:
+      app: hdfs-namenode-app
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: hdfs-namenode-app
+        release: hdfs-ha
+    spec:
+      # Use hostNetwork so datanodes connect to namenode without going through an overlay network
+      # like weave. Otherwise, namenode fails to see physical IP address of datanodes.
+      # Disabling this will break data locality as namenode will see pod virtual IPs and fails to
+      # equate them with cluster node physical IPs associated with data nodes.
+      # We currently disable this only for CI on minikube.
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        # TODO: Support hadoop version as option.
+        - name: hdfs-namenode
+          imagePullPolicy: IfNotPresent
+          image: mariolopezz/hadoop-namenode:2.7.2
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+            # Used by the start script below.
+            - name: MY_POD
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMENODE_POD_0
+              value: hdfs-namenode-0
+            - name: NAMENODE_POD_1
+              value: hdfs-namenode-1
+          command: ['/bin/sh', '-c']
+          # The start script is provided by a config map.
+          args:
+            - /entrypoint.sh "/nn-scripts/format-and-run.sh"
+          ports:
+          - containerPort: 8020
+            name: fs
+          - containerPort: 50070
+            name: http
+          volumeMounts:
+            - name: nn-scripts
+              mountPath: /nn-scripts
+              readOnly: true
+            # Mount a subpath of the volume so that the name subdir would be a
+            # brand new empty dir. This way, we won't get affected by existing
+            # files in the volume top dir.
+            - name: metadatadir
+              mountPath: /hadoop/dfs/name
+              subPath: name
+            - name: hdfs-env
+              mountPath: /etc/environments
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+      restartPolicy: Always
+      volumes:
+        - name: nn-scripts
+          configMap:
+            name: hdfs-namenode-scripts
+            defaultMode: 0744
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+        - name: hdfs-env
+          configMap:
+            name: hdfs-config
+  volumeClaimTemplates:
+    - metadata:
+        name: metadatadir
+      spec:
+        accessModes: 
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 10Gi
