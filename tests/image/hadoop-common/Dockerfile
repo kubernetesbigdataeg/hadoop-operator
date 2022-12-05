@@ -1,7 +1,7 @@
 FROM debian:stretch-backports
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y -t stretch-backports --no-install-recommends openjdk-8-jre-headless ca-certificates-java
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y -t stretch-backports --no-install-recommends openjdk-8-jre-headless ca-certificates-java dnsutils
     
 ENV JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64/
 
@@ -36,6 +36,7 @@ RUN touch /var/log/dmesg \
 RUN apt update \
     && apt install wget -y \
     && apt install procps -y \
+    && apt install dnsutils -y \
     && wget https://github.com/kubernetesbigdataeg/propgen/releases/latest/download/propgen
 
 RUN chmod 777 propgen

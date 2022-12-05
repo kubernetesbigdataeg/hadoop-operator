@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hdfs-client
+  labels:
+    app: hdfs-client
+    release: hdfs-ha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hdfs-client
+      release: hdfs-ha
+  template:
+    metadata:
+      labels:
+        app: hdfs-client
+        release: hdfs-ha
+    spec:
+      containers:
+        - name: hdfs-client
+          imagePullPolicy: IfNotPresent
+          image: kubernetesbigdataeg/hadoop:2.7.2-1
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+          command: ['/bin/sh', '-c']
+          args:
+            - /entrypoint.sh /usr/bin/tail -f /var/log/dmesg
+          volumeMounts:
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+      restartPolicy: Always
+      volumes:
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config

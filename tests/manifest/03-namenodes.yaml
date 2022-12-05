@@ -1,0 +1,136 @@
+# A headless service to create DNS records.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs-namenode-svc
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+  annotations:
+    # TODO: Deprecated. Replace tolerate-unready-endpoints with
+    # v1.Service.PublishNotReadyAddresses.
+    service.alpha.kubernetes.io/tolerate-unready-endpoints: "true"
+spec:
+  ports:
+  - port: 8020
+    name: fs
+  - port: 50070
+    name: http
+  clusterIP: None
+  selector:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hdfs-namenode
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app: hdfs-namenode-app
+      release: hdfs-ha
+  minAvailable: 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-namenode
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+spec:
+  serviceName: hdfs-namenode-svc
+  selector:
+    matchLabels:
+      app: hdfs-namenode-app
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: hdfs-namenode-app
+        release: hdfs-ha
+    spec:
+      # Use hostNetwork so datanodes connect to namenode without going through an overlay network
+      # like weave. Otherwise, namenode fails to see physical IP address of datanodes.
+      # Disabling this will break data locality as namenode will see pod virtual IPs and fails to
+      # equate them with cluster node physical IPs associated with data nodes.
+      # We currently disable this only for CI on minikube.
+      hostNetwork: true
+      # hostPID when set to true allows a pod to have access to the host process 
+      # ID namespace. This means that from a pod someone could find all of the 
+      # processes running on a host and potentially take malicious action.
+      hostPID: false
+      # By default, DNS policy for a pod is ‘ClusterFirst’. So pods running with 
+      # hostNetwork cannot resolve DNS names. To have DNS options set along with 
+      # hostNetwork, you should specify DNS policy explicitly to ‘ClusterFirstWithHostNet’.
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        # TODO: Support hadoop version as option.
+        - name: hdfs-namenode
+          imagePullPolicy: IfNotPresent
+          image: kubernetesbigdataeg/hadoop-namenode:2.7.2-1
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+            # Used by the start script below.
+            - name: MY_POD
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMENODE_POD_0
+              value: hdfs-namenode-0
+            - name: NAMENODE_POD_1
+              value: hdfs-namenode-1
+          command: ['/bin/sh', '-c']
+          # The start script is provided by a config map.
+          args:
+            - /entrypoint.sh "/nn-scripts/format-and-run.sh"
+              #- /entrypoint.sh "/nn-scripts/do-nothing.sh"
+          ports:
+          - containerPort: 8020
+            name: fs
+          - containerPort: 50070
+            name: http
+          volumeMounts:
+            - name: nn-scripts
+              mountPath: /nn-scripts
+              readOnly: true
+            # Mount a subpath of the volume so that the name subdir would be a
+            # brand new empty dir. This way, we won't get affected by existing
+            # files in the volume top dir.
+            - name: metadatadir
+              mountPath: /hadoop/dfs/name
+              subPath: name
+            - name: hdfs-env
+              mountPath: /etc/environments
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+      restartPolicy: Always
+      volumes:
+        - name: nn-scripts
+          configMap:
+            name: hdfs-namenode-scripts
+            defaultMode: 0744
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+        - name: hdfs-env
+          configMap:
+            name: hdfs-config
+  volumeClaimTemplates:
+    - metadata:
+        name: metadatadir
+      spec:
+        accessModes: 
+          - ReadWriteOnce
+        storageClassName: fast-disks
+        resources:
+          requests:
+            storage: 20Mi
+
