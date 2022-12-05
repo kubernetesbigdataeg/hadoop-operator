@@ -1,0 +1,149 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-config
+  labels:
+    app: hdfs-config
+    release: hdfs-ha
+data:
+  hadoop.env: |
+    export HADOOP__coresite__fs_defaultFS="hdfs://hdfs-k8s"
+    export HADOOP__coresite__ha_zookeeper_quorum="zk-0.zk-hs.default.svc.cluster.local:2181,zk-1.zk-hs.default.svc.cluster.local:2181,zk-2.zk-hs.default.svc.cluster.local:2181"
+    export HADOOP__hdfssite__dfs_nameservices="hdfs-k8s"
+    export HADOOP__hdfssite__dfs_ha_namenodes_hdfs___k8s="nn0,nn1"
+    export HADOOP__hdfssite__dfs_namenode_rpc___address_hdfs___k8s_nn0="hdfs-namenode-0.hdfs-namenode-svc.default.svc.cluster.local:8020"
+    export HADOOP__hdfssite__dfs_namenode_rpc___address_hdfs___k8s_nn1="hdfs-namenode-1.hdfs-namenode-svc.default.svc.cluster.local:8020"
+    export HADOOP__hdfssite__dfs_namenode_http___address_hdfs___k8s_nn0="hdfs-namenode-0.hdfs-namenode-svc.default.svc.cluster.local:50070"
+    export HADOOP__hdfssite__dfs_namenode_http___address_hdfs___k8s_nn1="hdfs-namenode-1.hdfs-namenode-svc.default.svc.cluster.local:50070"
+    export HADOOP__hdfssite__dfs_namenode_shared_edits_dir="qjournal://hdfs-journalnode-0.hdfs-journalnode-svc.default.svc.cluster.local:8485;hdfs-journalnode-1.hdfs-journalnode-svc.default.svc.cluster.local:8485;hdfs-journalnode-2.hdfs-journalnode-svc.default.svc.cluster.local:8485/hdfs-k8s"
+    export HADOOP__hdfssite__dfs_ha_automatic___failover_enabled="true"
+    export HADOOP__hdfssite__dfs_ha_fencing_methods="shell(/bin/true)"
+    export HADOOP__hdfssite__dfs_journalnode_edits_dir="/hadoop/dfs/journal"
+    export HADOOP__hdfssite__dfs_client_failover_proxy_provider_hdfs___k8s="org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider"
+    export HADOOP__hdfssite__dfs_namenode_name_dir="file:///hadoop/dfs/name"
+    export HADOOP__hdfssite__dfs_namenode_datanode_registration_ip___hostname___check="false"
+    export HADOOP__hdfssite__dfs_datanode_data_dir="/hadoop/dfs/data"
+---
+# Provides datanode helper scripts.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-datanode-scripts
+  labels:
+    app: hdfs-datanode-app
+    release: hdfs-ha
+data:
+  check-status.sh: |
+    #!/usr/bin/env bash
+    # Exit on error. Append "|| true" if you expect an error.
+    #set -o errexit
+    # Exit on error inside any functions or subshells.
+    #set -o errtrace
+    # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+    #set -o nounset
+    # Catch an error in command pipes. e.g. mysqldump fails (but gzip succeeds)
+    # in `mysqldump |gzip`
+    #set -o pipefail
+    # Turn on traces, useful while debugging.
+    set -o xtrace
+
+    # Check if datanode registered with the namenode and got non-null cluster ID.
+    _PORTS="50075 1006"
+    _URL_PATH="jmx?qry=Hadoop:service=DataNode,name=DataNodeInfo"
+    _CLUSTER_ID=""
+    for _PORT in $_PORTS; do
+      _CLUSTER_ID+=$(curl -s http://localhost:${_PORT}/$_URL_PATH |  \
+          grep ClusterId) || true
+    done
+    echo $_CLUSTER_ID | grep -q -v null
+---
+# Provides namenode helper scripts. Most of them are start scripts
+# that meet different needs.
+# TODO: Support upgrade of metadata in case a new Hadoop version requires it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hdfs-namenode-scripts
+  labels:
+    app: hdfs-namenode-app
+    release: hdfs-ha
+data:
+  # A bootstrap script which will start namenode daemons after conducting
+  # optional metadata initialization steps. The metadata initialization
+  # steps will take place in case the metadata dir is empty,
+  # which will be the case only for the very first run. The specific steps
+  # will differ depending on whether the namenode is active or standby.
+  # We also assume, for the very first run, namenode-0 will be active and
+  # namenode-1 will be standby as StatefulSet will launch namenode-0 first
+  # and zookeeper will determine the sole namenode to be the active one.
+  # For active namenode, the initialization steps will format the metadata,
+  # zookeeper dir and journal node data entries.
+  # For standby namenode, the initialization steps will simply receieve
+  # the first batch of metadata updates from the journal node.
+  format-and-run.sh: |
+    #!/usr/bin/env bash
+    # Exit on error. Append "|| true" if you expect an error.
+    # set -o errexit
+    # Exit on error inside any functions or subshells.
+    # set -o errtrace
+    # Do not allow use of undefined vars. Use ${VAR:-} to use an undefined VAR
+    # set -o nounset
+    # Catch an error in command pipes. e.g. mysqldump fails (but gzip succeeds)
+    # in `mysqldump |gzip`
+    # set -o pipefail
+    # Turn on traces, useful while debugging.
+    set -o xtrace
+    #apt-get install procps -y 
+    #apt-get install dnsutils -y 
+    _HDFS_BIN=$HADOOP_PREFIX/bin/hdfs
+    _METADATA_DIR=/hadoop/dfs/name/current
+
+    if [[ "$MY_POD" = "$NAMENODE_POD_0" ]]; then
+      echo "READY TO FORMATING NAMENODE: $NAMENODE_POD_0"
+      if [[ ! -d $_METADATA_DIR ]]; then
+          echo "FORMATING NAMENODE: $NAMENODE_POD_0"
+          $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -format -nonInteractive hdfs-k8s 
+              #(echo "ERROR FORMATING: erasing current folder"; rm -rf $_METADATA_DIR)
+      else
+        echo "ALREADY FORMATED NAMENODE: $NAMENODE_POD_0 (exits $_METADATA_DIR folder)"
+      fi
+
+      _ZKFC_FORMATTED=/hadoop/dfs/name/current/.hdfs-k8s-zkfc-formatted
+      if [[ ! -f $_ZKFC_FORMATTED ]]; then
+        echo "FORMATING ZKFC: $NAMENODE_POD_0"
+        #_OUT=$($_HDFS_BIN --config $HADOOP_CONF_DIR zkfc -formatZK -nonInteractive 2>&1)
+        $_HDFS_BIN --config $HADOOP_CONF_DIR zkfc -formatZK -nonInteractive 2>&1
+        # zkfc masks fatal exceptions and returns exit code 0
+        #(echo $_OUT | grep -q "FATAL") && echo "ZKFC FORMATING ERROR!! (EXITING CONTAINER)" && exit 1
+        touch $_ZKFC_FORMATTED
+        echo "TOUCHING $_ZKFC_FORMATTED"
+      else
+        echo "ALREADY FORMATED ZKFC: $NAMENODE_POD_0"
+      fi
+
+    elif [[ "$MY_POD" = "$NAMENODE_POD_1" ]]; then
+      echo "I AM $NAMENODE_POD_1 STARTING AS STANDBY"
+      if [[ ! -d $_METADATA_DIR ]]; then
+        $_HDFS_BIN --config $HADOOP_CONF_DIR namenode -bootstrapStandby -nonInteractive 
+        #(rm -rf $_METADATA_DIR; echo "STANDBY ERROR (EXITING CONTAINER)"; exit 1)
+      fi
+    fi
+
+    echo "STARING ZKFC: $NAMENODE_POD_0"
+    $HADOOP_PREFIX/sbin/hadoop-daemon.sh --config $HADOOP_CONF_DIR start zkfc
+    echo "STARING NAMENODE: $NAMENODE_POD_0"
+    $_HDFS_BIN --config $HADOOP_CONF_DIR namenode
+
+  # A start script that will just hang indefinitely. A user can then get
+  # inside the pod and debug. Or a user can conduct a custom manual operations.
+  do-nothing.sh: |
+    #!/usr/bin/env bash
+    touch /var/log/dmesg
+    tail -f /var/log/dmesg
+
+  # A start script that has user specified content. Can be used to conduct
+  # ad-hoc operation as specified by a user.
+  custom-run.sh: "#!/bin/bash -x
+    echo Write your own script content!
+    echo This message will disappear in 10 seconds.
+    sleep 10"

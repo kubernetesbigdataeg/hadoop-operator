@@ -1,0 +1,70 @@
+# Deleting a daemonset may need some trick. See
+# https://github.com/kubernetes/kubernetes/issues/33245#issuecomment-261250489
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: hdfs-datanode
+  labels:
+    app: hdfs-datanode-app
+    release: hdfs-ha
+spec:
+  selector:
+    matchLabels:
+      app:  hdfs-datanode-app
+  template:
+    metadata:
+      labels:
+        app: hdfs-datanode-app
+        release: hdfs-ha
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: datanode
+          imagePullPolicy: IfNotPresent
+          image: kubernetesbigdataeg/hadoop-datanode:2.7.2-1
+          env:
+            - name: HADOOP_CUSTOM_CONF_DIR
+              value: /etc/hadoop-custom-conf
+            - name: MULTIHOMED_NETWORK
+              value: "0"
+          livenessProbe:
+            exec:
+              command:
+                - /dn-scripts/check-status.sh
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command:
+                - /dn-scripts/check-status.sh
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: dn-scripts
+              mountPath: /dn-scripts
+              readOnly: true
+            - name: hdfs-env
+              mountPath: /etc/environments
+            - name: hdfs-config
+              mountPath: /etc/hadoop-custom-conf
+            - name: hdfs-data
+              mountPath: /hadoop/dfs/data/
+      restartPolicy: Always
+      volumes:
+        - name: dn-scripts
+          configMap:
+            name: hdfs-datanode-scripts
+            defaultMode: 0744
+        - name: hdfs-data
+          hostPath:
+            path: /hdfs-data
+        - name: hdfs-config
+          hostPath:
+            path: /hdfs-config
+        - name: hdfs-env
+          configMap:
+            name: hdfs-config
